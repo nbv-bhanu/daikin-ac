@@ -1,0 +1,63 @@
+name: Build Daikin AC APK
+
+on:
+  push:
+    branches: [ main ]
+  workflow_dispatch:
+
+jobs:
+  build-apk:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+        with:
+          path: source_files
+
+      - name: Set up Java 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: 'zulu'
+          java-version: '17'
+
+      - name: Set up Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.27.1'
+          channel: 'stable'
+          cache: true
+
+      - name: Create Flutter project scaffold
+        run: |
+          flutter create daikin_app \
+            --project-name accontroller \
+            --org com.daikin \
+            --platforms android \
+            --no-pub
+
+      - name: Copy our custom source files
+        run: |
+          rm -rf daikin_app/lib
+          cp -r source_files/lib daikin_app/lib
+          cp source_files/pubspec.yaml daikin_app/pubspec.yaml
+          cp source_files/android/app/src/main/AndroidManifest.xml \
+             daikin_app/android/app/src/main/AndroidManifest.xml
+          mkdir -p daikin_app/android/app/src/main/kotlin/com/daikin/accontroller
+          cp source_files/android/app/src/main/kotlin/com/daikin/accontroller/MainActivity.kt \
+             daikin_app/android/app/src/main/kotlin/com/daikin/accontroller/MainActivity.kt
+
+      - name: Get Flutter packages
+        working-directory: daikin_app
+        run: flutter pub get
+
+      - name: Build release APK
+        working-directory: daikin_app
+        run: flutter build apk --release
+
+      - name: Upload APK artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: Daikin-AC-Controller-APK
+          path: daikin_app/build/app/outputs/flutter-apk/app-release.apk
+          retention-days: 30
