@@ -1,6 +1,14 @@
 <manifest xmlns:android="http://schemas.android.com/apk/res/android">
 
-    <!-- IR Blaster permission -->
+    <!--
+        TRANSMIT_IR is required for ConsumerIrManager to work on Android (API 19+).
+        It is a NORMAL permission — auto-granted, no user dialog needed.
+        MIUI on Xiaomi/Redmi specifically checks for this permission.
+        Without it, MIUI throws SecurityException and blocks all IR transmissions.
+    -->
+    <uses-permission android:name="android.permission.TRANSMIT_IR" />
+
+    <!-- Declare IR hardware feature (required=false so app still installs on non-IR phones) -->
     <uses-feature android:name="android.hardware.consumerir" android:required="false" />
 
     <application
@@ -28,8 +36,6 @@
             </intent-filter>
         </activity>
 
-        <meta-data
-            android:name="flutterEmbedding"
-            android:value="2" />
+        <meta-data android:name="flutterEmbedding" android:value="2" />
     </application>
 </manifest>
