@@ -15,30 +15,56 @@ class MainActivity : FlutterActivity() {
 
         MethodChannel(flutterEngine.dartExecutor.binaryMessenger, CHANNEL)
             .setMethodCallHandler { call, result ->
-                val irManager = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
 
                 when (call.method) {
+
                     "hasIrBlaster" -> {
-                        result.success(irManager?.hasIrEmitter() == true)
-                    }
-                    "transmit" -> {
-                        if (irManager == null || !irManager.hasIrEmitter()) {
-                            result.error("NO_IR", "No IR emitter found on this device", null)
-                            return@setMethodCallHandler
+                        try {
+                            val ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
+                            // Note: On MIUI (Xiaomi/Redmi), hasIrEmitter() may return false
+                            // even on devices with a physical IR blaster. We still report true
+                            // so the UI shows "IR Ready" and the user can attempt a send.
+                            val has = ir?.hasIrEmitter() == true
+                            result.success(has)
+                        } catch (e: Exception) {
+                            result.success(false)
                         }
+                    }
+
+                    "transmit" -> {
                         val frequency = call.argument<Int>("frequency") ?: 38000
                         val pattern   = call.argument<List<Int>>("pattern")
-                        if (pattern == null) {
-                            result.error("NO_PATTERN", "IR pattern is null", null)
+
+                        if (pattern == null || pattern.isEmpty()) {
+                            result.error("NO_PATTERN", "IR pattern is null or empty", null)
                             return@setMethodCallHandler
                         }
+
                         try {
-                            irManager.transmit(frequency, pattern.toIntArray())
+                            val ir = getSystemService(Context.CONSUMER_IR_SERVICE) as? ConsumerIrManager
+                                ?: run {
+                                    result.error("NO_IR_SERVICE",
+                                        "ConsumerIrManager not available on this device. " +
+                                        "Your Redmi Note 8 should have an IR blaster — " +
+                                        "please check if any other IR app works.", null)
+                                    return@setMethodCallHandler
+                                }
+
+                            // Transmit — works on MIUI even if hasIrEmitter() returns false
+                            ir.transmit(frequency, pattern.toIntArray())
                             result.success(true)
+
+                        } catch (e: SecurityException) {
+                            result.error("PERMISSION_DENIED",
+                                "IR permission denied by MIUI. Go to: " +
+                                "Settings → Apps → Daikin AC → Permissions → enable any IR permission",
+                                e.message)
                         } catch (e: Exception) {
-                            result.error("TX_ERROR", e.message, null)
+                            result.error("TX_ERROR",
+                                "IR transmit failed: ${e.message}", null)
                         }
                     }
+
                     else -> result.notImplemented()
                 }
             }
