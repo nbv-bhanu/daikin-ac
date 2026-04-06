@@ -1,20 +1,31 @@
-// Daikin Classic IR Protocol – ARC484B32 / ARC484A series
-// Framing based on IRremoteESP8266 (crankyoldgit) – most hardware-tested implementation
-// https://github.com/crankyoldgit/IRremoteESP8266/blob/master/src/ir_Daikin.cpp
+// Daikin Classic IR Protocol – ARC484B32
+// Structure confirmed by real remote captures:
+//   stackoverflow.com/questions/72725599 (web:153)
+//   github.com/YSYouJack/Daikin-ir-control-rpi (web:32)
+//
+// Signal layout:
+//   PRE-BURST (6 zero-bits minus last space + 25ms gap)
+//   → Frame1 (8 bytes fixed) + 35ms gap
+//   → Frame2 (8 bytes fixed) + 35ms gap
+//   → Frame3 (19 bytes command)
+//   Repeat entire sequence N times for "hold" behaviour
 
-const int kDaikinFrequency = 38000; // 38 kHz carrier
+const int kDaikinFrequency = 38000; // 38 kHz
 
-// Timing constants (microseconds) – from IRremoteESP8266
-const int kDaikinHdrMark   = 3650;
-const int kDaikinHdrSpace  = 1623;
-const int kDaikinBitMark   = 428;
-const int kDaikinOneSpace  = 1320;
-const int kDaikinZeroSpace = 428;
-const int kDaikinGap       = 29000;  // inter-frame / preamble gap
+// Timing from real captures (YSYouJack + StackOverflow)
+const int kHdrMark   = 3500;   // frame header mark
+const int kHdrSpace  = 1700;   // frame header space
+const int kBitMark   = 440;    // every bit mark
+const int kOneSpace  = 1300;   // bit-1 space
+const int kZeroSpace = 430;    // bit-0 space
+const int kPreBit    = 440;    // pre-burst pulse
+const int kPreGap    = 430;    // pre-burst gap
+const int kStartGap  = 25000; // gap after pre-burst
+const int kFrameGap  = 35000; // gap between frames
 
-// Fixed frame bytes (verified against IRremoteESP8266 kDaikinFirstFrame/SecondFrame)
-const List<int> kDaikinFrame1 = [0x11, 0xDA, 0x27, 0x00, 0xC5, 0x00, 0x00, 0xD7];
-const List<int> kDaikinFrame2 = [0x11, 0xDA, 0x27, 0x00, 0x42, 0x00, 0x00, 0x54];
+// Fixed frames (verified against IRremoteESP8266 + community)
+const List<int> kFrame1 = [0x11,0xDA,0x27,0x00,0xC5,0x00,0x00,0xD7];
+const List<int> kFrame2 = [0x11,0xDA,0x27,0x00,0x42,0x00,0x00,0x54];
 
 // Mode codes
 const int kModeAuto = 0;
@@ -32,96 +43,100 @@ class DaikinProtocol {
   static int _checksum(List<int> data) =>
       data.fold(0, (s, b) => (s + b) & 0xFF);
 
-  // Build the 19-byte settings frame
-  // Byte layout (verified from IRremoteESP8266 + community captures):
-  //   [0-3]: 0x11 0xDA 0x27 0x00 (fixed header)
-  //   [4]  : code = 0x00
-  //   [5]  : power(bit0) | timerOn(bit1) | timerOff(bit2) | 1(bit3) | mode(bits7-4)
-  //   [6]  : temperature × 2  (e.g. 25°C → 0x32)
-  //   [7]  : 0x00
-  //   [8]  : swingV(bits3-0) | fanSpeed(bits7-4)
-  //   [9]  : swingH(bits3-0)
-  //   [10-16]: timer & feature bytes
-  //   [17] : powerful(bit0) | silent(bit5) | economy(bit2) | ecoSensing(bit1)
-  //   [18] : checksum
+  // ── Build 19-byte settings frame ────────────────────────────────────────
   static List<int> buildSettingsFrame({
     required bool power,
-    int  mode        = kModeAuto,
-    int  tempHalf    = 50,    // 25°C × 2 = 50
-    int  fanSpeed    = kFanAuto,
-    int  swingV      = 0,     // 0=off, 0xF=on
-    int  swingH      = 0,
-    bool powerful    = false,
-    bool silent      = false,
-    bool economy     = false,
-    bool ecoSensing  = false,
+    int  mode       = kModeAuto,
+    int  tempHalf   = 50,   // 25°C × 2
+    int  fanSpeed   = kFanAuto,
+    int  swingV     = 0,    // 0=off, 0xF=on
+    int  swingH     = 0,
+    bool powerful   = false,
+    bool silent     = false,
+    bool economy    = false,
+    bool ecoSensing = false,
   }) {
     final s = List<int>.filled(19, 0);
-    s[0] = 0x11;
-    s[1] = 0xDA;
-    s[2] = 0x27;
-    s[3] = 0x00;
+    s[0] = 0x11; s[1] = 0xDA; s[2] = 0x27; s[3] = 0x00;
     s[4] = 0x00; // settings frame code
 
-    // Byte 5: power | timerOn | timerOff | always-1 | mode
-    s[5] = (power ? 0x01 : 0x00)
-         | 0x08                        // bit3 always 1
-         | ((mode & 0x0F) << 4);
-
-    // Byte 6: temperature in half-degrees
-    s[6] = tempHalf & 0xFF;
-
-    s[7] = 0x00;
-
-    // Byte 8: swingV (lower nibble) | fanSpeed (upper nibble)
-    s[8] = (swingV & 0x0F) | ((fanSpeed & 0x0F) << 4);
-
-    // Byte 9: swingH (lower nibble)
-    s[9] = swingH & 0x0F;
-
-    s[10] = 0x00;
-    s[11] = 0x00;
-    s[12] = 0xC1; // default clock/display byte
+    // [5] power(bit0) | always-1(bit3) | mode(bits7-4)
+    s[5]  = (power ? 0x01 : 0x00) | 0x08 | ((mode & 0x0F) << 4);
+    // [6] temperature in half-degrees (25°C → 50 = 0x32)
+    s[6]  = tempHalf.clamp(32, 60);
+    s[7]  = 0x00;
+    // [8] swingV(lower nibble) | fanSpeed(upper nibble)
+    s[8]  = (swingV & 0x0F) | ((fanSpeed & 0x0F) << 4);
+    // [9] swingH(lower nibble)
+    s[9]  = swingH & 0x0F;
+    s[10] = 0x00; s[11] = 0x00;
+    s[12] = 0xC1; // default clock display byte
     s[13] = 0x80;
-    s[14] = 0x00;
-    s[15] = 0x00;
-    s[16] = 0x00;
-
-    // Byte 17: feature flags
+    s[14] = 0x00; s[15] = 0x00; s[16] = 0x00;
+    // [17] feature flags
     s[17] = (powerful    ? 0x01 : 0x00)
           | (ecoSensing  ? 0x02 : 0x00)
           | (economy     ? 0x04 : 0x00)
           | (silent      ? 0x20 : 0x00);
-
-    // Byte 18: checksum
+    // [18] checksum
     s[18] = _checksum(s.sublist(0, 18));
     return s;
   }
 
-  // Convert bytes to IR timing list (IRremoteESP8266 structure)
-  // Each frame = [preamble: 3650+29000] + [header: 3650+1623] + [bits LSB-first] + [stop: 428]
-  // Non-last frames add trailing 29000µs gap after stop bit
-  static List<int> _frameToSignal(List<int> frameBytes, {bool isLast = false}) {
-    final sig = <int>[];
-    // Preamble (sendDaikinGap equivalent)
-    sig.addAll([kDaikinHdrMark, kDaikinGap]);
-    // Frame header
-    sig.addAll([kDaikinHdrMark, kDaikinHdrSpace]);
-    // Data bits – LSB first for each byte
+  // ── Convert frame bytes → IR timing list (LSB first per byte) ────────────
+  static List<int> _frameToSignal(List<int> frameBytes) {
+    final sig = <int>[kHdrMark, kHdrSpace];
     for (final byte in frameBytes) {
       for (int i = 0; i < 8; i++) {
-        sig.add(kDaikinBitMark);
-        sig.add(((byte >> i) & 1) == 1 ? kDaikinOneSpace : kDaikinZeroSpace);
+        sig.add(kBitMark);
+        sig.add(((byte >> i) & 1) == 1 ? kOneSpace : kZeroSpace);
       }
     }
-    // Stop bit
-    sig.add(kDaikinBitMark);
-    // Trailing gap for frames 1 & 2
-    if (!isLast) sig.add(kDaikinGap);
+    sig.add(kBitMark); // stop bit
     return sig;
   }
 
-  /// Build the complete IR pattern (microsecond durations, starts with MARK)
+  // ── Build one full transmission (pre-burst + 3 frames) ───────────────────
+  static List<int> _buildOnce({
+    required bool power,
+    int  mode       = kModeAuto,
+    double tempC    = 25.0,
+    int  fanSpeed   = kFanAuto,
+    bool swingV     = false,
+    bool swingH     = false,
+    bool powerful   = false,
+    bool silent     = false,
+    bool economy    = false,
+    bool ecoSensing = false,
+  }) {
+    final tempHalf = (tempC * 2).round().clamp(32, 60);
+    final frame3 = buildSettingsFrame(
+      power: power, mode: mode, tempHalf: tempHalf,
+      fanSpeed: fanSpeed,
+      swingV: swingV ? 0xF : 0, swingH: swingH ? 0xF : 0,
+      powerful: powerful, silent: silent,
+      economy: economy, ecoSensing: ecoSensing,
+    );
+
+    // Pre-burst: 6 × [440 ON + 430 OFF] minus last OFF, then 25000 gap
+    final pre = <int>[];
+    for (int i = 0; i < 6; i++) {
+      pre.addAll([kPreBit, kPreGap]);
+    }
+    pre.removeLast();        // remove final gap
+    pre.add(kStartGap);      // 25 ms silence
+
+    return [
+      ...pre,
+      ..._frameToSignal(kFrame1), kFrameGap,
+      ..._frameToSignal(kFrame2), kFrameGap,
+      ..._frameToSignal(frame3),
+    ];
+  }
+
+  /// Build signal repeated [count] times.
+  /// For POWER ON of older Daikin (2012-2013), use count=8 to mimic
+  /// "press and hold for 2-3 seconds" behaviour.
   static List<int> buildSignal({
     required bool power,
     int    mode       = kModeAuto,
@@ -133,26 +148,21 @@ class DaikinProtocol {
     bool   silent     = false,
     bool   economy    = false,
     bool   ecoSensing = false,
+    int    repeat     = 1,
   }) {
-    final tempHalf = (tempC * 2).round().clamp(32, 60); // 16–30°C
-
-    final frame3 = buildSettingsFrame(
-      power:      power,
-      mode:       mode,
-      tempHalf:   tempHalf,
-      fanSpeed:   fanSpeed,
-      swingV:     swingV ? 0xF : 0,
-      swingH:     swingH ? 0xF : 0,
-      powerful:   powerful,
-      silent:     silent,
-      economy:    economy,
-      ecoSensing: ecoSensing,
+    final single = _buildOnce(
+      power: power, mode: mode, tempC: tempC, fanSpeed: fanSpeed,
+      swingV: swingV, swingH: swingH, powerful: powerful,
+      silent: silent, economy: economy, ecoSensing: ecoSensing,
     );
+    if (repeat <= 1) return single;
 
-    return [
-      ..._frameToSignal(kDaikinFrame1, isLast: false),
-      ..._frameToSignal(kDaikinFrame2, isLast: false),
-      ..._frameToSignal(frame3,        isLast: true),
-    ];
+    // Stitch repetitions together with a 100ms inter-repetition space
+    final full = <int>[...single];
+    for (int r = 1; r < repeat; r++) {
+      full.add(100000); // 100ms gap between repetitions
+      full.addAll(single);
+    }
+    return full;
   }
 }
