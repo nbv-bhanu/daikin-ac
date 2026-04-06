@@ -13,8 +13,14 @@ class IrService {
     }
   }
 
-  /// Returns null on success, or an error message String on failure.
-  static Future<String?> sendState(AcState state) async {
+  /// Returns null on success, or an error message on failure.
+  /// [isPowerToggle] = true → repeat signal 8 times to simulate "hold 2-3 sec"
+  static Future<String?> sendState(AcState state, {bool isPowerToggle = false}) async {
+    // Older Daikin ACs (2012-2013) require receiving the power command
+    // multiple times before the compressor engages — this mimics holding
+    // the ON/OFF button on the physical remote for 2-3 seconds.
+    final repeatCount = isPowerToggle ? 8 : 1;
+
     final pattern = DaikinProtocol.buildSignal(
       power:      state.power,
       mode:       state.mode,
@@ -26,7 +32,9 @@ class IrService {
       silent:     state.silent,
       economy:    state.economy,
       ecoSensing: state.ecoSensing,
+      repeat:     repeatCount,
     );
+
     try {
       await _channel.invokeMethod<bool>('transmit', {
         'frequency': kDaikinFrequency,
