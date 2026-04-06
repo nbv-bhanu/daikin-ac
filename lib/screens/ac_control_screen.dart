@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 import '../models/ac_state.dart';
@@ -11,9 +12,12 @@ class AcControlScreen extends StatefulWidget {
 }
 
 class _AcControlScreenState extends State<AcControlScreen> {
-  AcState _state = AcState();
-  bool _hasIr   = false;
-  bool _sending  = false;
+  AcState _state   = AcState();
+  bool _hasIr      = false;
+  bool _sending    = false;
+  bool _holding    = false;
+  Timer? _holdTimer;
+  int  _holdCount  = 0;
 
   static const Color _bg     = Color(0xFF0D1117);
   static const Color _card   = Color(0xFF161B22);
@@ -29,35 +33,93 @@ class _AcControlScreenState extends State<AcControlScreen> {
     IrService.hasIrBlaster().then((v) => setState(() => _hasIr = v));
   }
 
-  // ── Send IR signal and show prominent result feedback ─────────────────────
+  @override
+  void dispose() {
+    _holdTimer?.cancel();
+    super.dispose();
+  }
+
+  // ── Normal send for mode/temp/fan buttons (single transmission) ───────────
   Future<void> _send(AcState newState) async {
-    if (_sending) return;
+    if (_sending || _holding) return;
     setState(() { _state = newState; _sending = true; });
-
-    final error = await IrService.sendState(newState);
-
+    final error = await IrService.sendState(newState, isPowerToggle: false);
     setState(() => _sending = false);
     if (!mounted) return;
-
     if (error == null) {
-      final info = newState.power
-          ? 'ON  |  ' + newState.modeLabel + '  |  ' + newState.temperature.toStringAsFixed(0) + '°C'
-          : 'OFF';
-      ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-        content: Row(children: [
-          const Icon(Icons.check_circle, color: Colors.white, size: 18),
-          const SizedBox(width: 8),
-          Text('Signal sent → ' + info),
-        ]),
-        backgroundColor: _green,
-        duration: const Duration(seconds: 2),
-      ));
+      _showSnack('Signal sent → ' + newState.modeLabel + ' ' +
+          newState.temperature.toStringAsFixed(0) + '°C  Fan: ' + newState.fanLabel);
     } else {
-      _showErrorDialog(error);
+      _showError(error);
     }
   }
 
-  void _showErrorDialog(String error) {
+  // ── POWER tap: send 8 repetitions (simulates 2-3 sec hold on remote) ─────
+  Future<void> _powerTap() async {
+    if (_sending || _holding) return;
+    final newState = _state.copyWith(power: !_state.power);
+    setState(() { _state = newState; _sending = true; });
+
+    _showSnack(!newState.power
+        ? 'Sending OFF command (8 signals)...'
+        : 'Sending ON command (8 signals, ~2 sec)...');
+
+    final error = await IrService.sendState(newState, isPowerToggle: true);
+    setState(() => _sending = false);
+    if (!mounted) return;
+    if (error == null) {
+      _showSnack(newState.power ? '✅ AC ON command sent!' : '✅ AC OFF command sent!',
+          color: _green);
+    } else {
+      _showError(error);
+    }
+  }
+
+  // ── POWER long-press: keep firing every 300ms while finger held ───────────
+  void _startHold() {
+    if (_sending) return;
+    final newState = _state.copyWith(power: !_state.power);
+    setState(() { _state = newState; _holding = true; _holdCount = 0; });
+
+    // Fire immediately
+    _sendHoldPulse(newState);
+
+    // Then every 300ms
+    _holdTimer = Timer.periodic(const Duration(milliseconds: 350), (_) {
+      if (!_holding) return;
+      setState(() => _holdCount++);
+      _sendHoldPulse(newState);
+    });
+  }
+
+  Future<void> _sendHoldPulse(AcState s) async {
+    await IrService.sendState(s, isPowerToggle: false);
+  }
+
+  void _stopHold() {
+    _holdTimer?.cancel();
+    _holdTimer = null;
+    if (!mounted) return;
+    setState(() { _holding = false; });
+    _showSnack(
+      _state.power
+          ? '✅ ON command sent ' + (_holdCount + 1).toString() + 'x while held'
+          : '✅ OFF command sent ' + (_holdCount + 1).toString() + 'x while held',
+      color: _green,
+    );
+  }
+
+  void _showSnack(String msg, {Color? color}) {
+    if (!mounted) return;
+    ScaffoldMessenger.of(context).clearSnackBars();
+    ScaffoldMessenger.of(context).showSnackBar(SnackBar(
+      content: Text(msg),
+      backgroundColor: color ?? _blue,
+      duration: const Duration(seconds: 3),
+    ));
+  }
+
+  void _showError(String error) {
     showDialog(
       context: context,
       builder: (_) => AlertDialog(
@@ -68,75 +130,47 @@ class _AcControlScreenState extends State<AcControlScreen> {
           SizedBox(width: 8),
           Text('IR Send Failed', style: TextStyle(color: Colors.white, fontSize: 16)),
         ]),
-        content: Column(
-          mainAxisSize: MainAxisSize.min,
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Container(
-              padding: const EdgeInsets.all(10),
-              decoration: BoxDecoration(
-                color: const Color(0xFF0D1117),
-                borderRadius: BorderRadius.circular(8),
-              ),
-              child: Text(error,
-                style: const TextStyle(color: Colors.orange, fontSize: 12, fontFamily: 'monospace')),
-            ),
-            const SizedBox(height: 14),
-            const Text('Try this:', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
-            const SizedBox(height: 6),
-            const Text(
-              '1. Point TOP EDGE of phone at AC\n'
-              '2. Keep 30–50 cm from the AC unit\n'
-              '3. No obstructions between phone & AC\n'
-              '4. Tap Test IR to confirm hardware',
-              style: TextStyle(color: Color(0xFF8B949E), fontSize: 12, height: 1.7),
-            ),
-          ],
-        ),
-        actions: [
-          TextButton(
-            onPressed: () { Navigator.pop(context); _sendIrTest(); },
-            child: const Text('Test IR', style: TextStyle(color: Color(0xFF8B949E))),
+        content: Column(mainAxisSize: MainAxisSize.min, crossAxisAlignment: CrossAxisAlignment.start, children: [
+          Container(
+            padding: const EdgeInsets.all(10),
+            decoration: BoxDecoration(color: _bg, borderRadius: BorderRadius.circular(8)),
+            child: Text(error, style: const TextStyle(color: Colors.orange, fontSize: 12)),
           ),
-          TextButton(
-            onPressed: () => Navigator.pop(context),
-            child: const Text('OK', style: TextStyle(color: Color(0xFF0078D7))),
+          const SizedBox(height: 12),
+          const Text('Tips:', style: TextStyle(color: Colors.white, fontWeight: FontWeight.bold)),
+          const SizedBox(height: 6),
+          const Text(
+            '• Point TOP EDGE of phone directly at AC\n'
+            '• Distance: 30-80 cm, clear line of sight\n'
+            '• Tap "IR Test" in top-right corner first',
+            style: TextStyle(color: Color(0xFF8B949E), fontSize: 12, height: 1.7),
           ),
-        ],
+        ]),
+        actions: [TextButton(
+          onPressed: () => Navigator.pop(context),
+          child: const Text('OK', style: TextStyle(color: Color(0xFF0078D7))),
+        )],
       ),
     );
   }
 
-  // ── IR hardware test: NEC test pulse via IrService ─────────────────────────
   Future<void> _sendIrTest() async {
     final testPattern = [
-      9000, 4500, 560, 560, 560, 1690, 560, 560, 560, 560,
-      560, 560, 560, 560, 560, 560, 560, 560, 560, 1690, 560, 1690, 560, 1690,
-      560, 1690, 560, 1690, 560, 1690, 560, 1690, 560, 560, 560, 1690, 560, 560,
-      560, 560, 560, 560, 560, 560, 560, 560, 560, 560, 560, 1690, 560, 560,
-      560, 1690, 560, 1690, 560, 1690, 560, 1690, 560, 1690, 560, 1690, 560, 1690, 560,
+      9000,4500,560,560,560,1690,560,560,560,560,560,560,560,560,560,560,
+      560,560,560,1690,560,1690,560,1690,560,1690,560,1690,560,1690,560,1690,
+      560,560,560,1690,560,560,560,560,560,560,560,560,560,560,560,560,
+      560,1690,560,560,560,1690,560,1690,560,1690,560,1690,560,1690,560,1690,560,1690,560,
     ];
     try {
       await const MethodChannel('com.daikin.accontroller/ir')
           .invokeMethod('transmit', {'frequency': 38000, 'pattern': testPattern});
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(const SnackBar(
-          content: Text('IR test pulse sent! If AC beeped, hardware is working.'),
-          backgroundColor: Color(0xFF0078D7),
-          duration: Duration(seconds: 3),
-        ));
-      }
+      if (mounted) _showSnack('IR test sent — hardware is working!', color: _green);
     } on PlatformException catch (e) {
-      if (mounted) {
-        ScaffoldMessenger.of(context).showSnackBar(SnackBar(
-          content: Text('IR hardware test FAILED: ' + (e.message ?? e.code)),
-          backgroundColor: _red,
-        ));
-      }
+      if (mounted) _showSnack('IR test FAILED: ' + (e.message ?? e.code), color: _red);
     }
   }
 
-  // ─── UI helpers ────────────────────────────────────────────────────────────
+  // ─── Widget helpers ───────────────────────────────────────────────────────
   Widget _modeBtn(String label, int mode, IconData icon) {
     final active = _state.mode == mode && _state.power;
     return GestureDetector(
@@ -153,8 +187,7 @@ class _AcControlScreenState extends State<AcControlScreen> {
           Icon(icon, color: active ? Colors.white : _dim, size: 20),
           const SizedBox(height: 4),
           Text(label, style: TextStyle(
-              color: active ? Colors.white : _dim,
-              fontSize: 10, fontWeight: FontWeight.w600)),
+              color: active ? Colors.white : _dim, fontSize: 10, fontWeight: FontWeight.w600)),
         ]),
       ),
     );
@@ -173,8 +206,7 @@ class _AcControlScreenState extends State<AcControlScreen> {
           border: Border.all(color: active ? _blue : _border),
         ),
         child: Text(label, style: TextStyle(
-            color: active ? Colors.white : _dim,
-            fontSize: 11, fontWeight: FontWeight.w600)),
+            color: active ? Colors.white : _dim, fontSize: 11, fontWeight: FontWeight.w600)),
       ),
     );
   }
@@ -190,16 +222,14 @@ class _AcControlScreenState extends State<AcControlScreen> {
           borderRadius: BorderRadius.circular(10),
           border: Border.all(color: active ? _blue : _border),
         ),
-        child: Center(
-          child: Text(label, textAlign: TextAlign.center,
-              style: TextStyle(color: active ? _blue : _dim,
-                  fontSize: 11, fontWeight: FontWeight.w600)),
-        ),
+        child: Center(child: Text(label, textAlign: TextAlign.center,
+            style: TextStyle(color: active ? _blue : _dim,
+                fontSize: 11, fontWeight: FontWeight.w600))),
       ),
     );
   }
 
-  // ─── Main build ────────────────────────────────────────────────────────────
+  // ─── Build ────────────────────────────────────────────────────────────────
   @override
   Widget build(BuildContext context) {
     return Scaffold(
@@ -208,206 +238,206 @@ class _AcControlScreenState extends State<AcControlScreen> {
         child: Stack(children: [
 
           SingleChildScrollView(
-            padding: const EdgeInsets.fromLTRB(16, 16, 16, 100),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
+            padding: const EdgeInsets.fromLTRB(16, 16, 16, 110),
+            child: Column(crossAxisAlignment: CrossAxisAlignment.stretch, children: [
 
-                // Header
-                Row(children: [
-                  const Icon(Icons.ac_unit, color: Color(0xFF0078D7), size: 22),
-                  const SizedBox(width: 8),
-                  const Text('Daikin AC',
-                      style: TextStyle(color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
-                  const Spacer(),
-                  GestureDetector(
-                    onTap: _sendIrTest,
-                    child: Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
-                      decoration: BoxDecoration(
-                        color: _hasIr ? _green.withAlpha(40) : _red.withAlpha(40),
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: _hasIr ? _green : _red),
-                      ),
-                      child: Row(mainAxisSize: MainAxisSize.min, children: [
-                        Icon(Icons.sensors, size: 12, color: _hasIr ? _green : _red),
-                        const SizedBox(width: 4),
-                        Text(_hasIr ? 'IR ✓ Test' : 'Test IR',
-                            style: TextStyle(color: _hasIr ? _green : _red, fontSize: 11)),
-                      ]),
+              // Header
+              Row(children: [
+                const Icon(Icons.ac_unit, color: Color(0xFF0078D7), size: 22),
+                const SizedBox(width: 8),
+                const Text('Daikin AC', style: TextStyle(
+                    color: Colors.white, fontSize: 20, fontWeight: FontWeight.bold)),
+                const Spacer(),
+                GestureDetector(
+                  onTap: _sendIrTest,
+                  child: Container(
+                    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+                    decoration: BoxDecoration(
+                      color: _hasIr ? _green.withAlpha(40) : _red.withAlpha(40),
+                      borderRadius: BorderRadius.circular(12),
+                      border: Border.all(color: _hasIr ? _green : _red),
                     ),
-                  ),
-                ]),
-                const SizedBox(height: 16),
-
-                // Temperature card
-                Container(
-                  padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
-                  decoration: BoxDecoration(
-                    color: _card,
-                    borderRadius: BorderRadius.circular(16),
-                    border: Border.all(color: _border),
-                  ),
-                  child: Column(children: [
-                    Text(
-                      _state.power ? _state.modeLabel.toUpperCase() : 'STANDBY',
-                      style: TextStyle(
-                          color: _state.power ? _blue : _dim,
-                          fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 2),
-                    ),
-                    const SizedBox(height: 10),
-                    Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                      GestureDetector(
-                        onTap: () {
-                          if (_state.temperature > 16) {
-                            _send(_state.copyWith(temperature: _state.temperature - 1, power: true));
-                          }
-                        },
-                        child: Container(
-                          width: 52, height: 52,
-                          decoration: BoxDecoration(
-                            color: _bg, borderRadius: BorderRadius.circular(14),
-                            border: Border.all(color: _border),
-                          ),
-                          child: const Icon(Icons.remove, color: Colors.white70, size: 26),
-                        ),
-                      ),
-                      const SizedBox(width: 20),
-                      Column(children: [
-                        Text(
-                          _state.temperature.toStringAsFixed(0) + '°C',
-                          style: const TextStyle(
-                              color: Colors.white, fontSize: 54, fontWeight: FontWeight.w200),
-                        ),
-                        Text('Fan: ' + _state.fanLabel,
-                            style: TextStyle(color: _dim, fontSize: 11)),
-                      ]),
-                      const SizedBox(width: 20),
-                      GestureDetector(
-                        onTap: () {
-                          if (_state.temperature < 30) {
-                            _send(_state.copyWith(temperature: _state.temperature + 1, power: true));
-                          }
-                        },
-                        child: Container(
-                          width: 52, height: 52,
-                          decoration: BoxDecoration(
-                            color: _bg, borderRadius: BorderRadius.circular(14),
-                            border: Border.all(color: _border),
-                          ),
-                          child: const Icon(Icons.add, color: Colors.white70, size: 26),
-                        ),
-                      ),
+                    child: Row(mainAxisSize: MainAxisSize.min, children: [
+                      Icon(Icons.sensors, size: 12, color: _hasIr ? _green : _red),
+                      const SizedBox(width: 4),
+                      Text(_hasIr ? 'IR ✓ Test' : 'Test IR',
+                          style: TextStyle(color: _hasIr ? _green : _red, fontSize: 11)),
                     ]),
+                  ),
+                ),
+              ]),
+              const SizedBox(height: 4),
+
+              // Hold hint banner
+              Container(
+                margin: const EdgeInsets.symmetric(vertical: 8),
+                padding: const EdgeInsets.all(10),
+                decoration: BoxDecoration(
+                  color: const Color(0xFF161B22),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: const Color(0xFFD29922).withAlpha(120)),
+                ),
+                child: const Row(children: [
+                  Icon(Icons.touch_app, color: Color(0xFFD29922), size: 16),
+                  SizedBox(width: 8),
+                  Expanded(child: Text(
+                    'TAP the power button once  —  OR  —  HOLD it for 2-3 sec (mimics your remote)',
+                    style: TextStyle(color: Color(0xFFD29922), fontSize: 11),
+                  )),
+                ]),
+              ),
+
+              // Temperature card
+              Container(
+                padding: const EdgeInsets.symmetric(vertical: 20, horizontal: 16),
+                decoration: BoxDecoration(
+                  color: _card, borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: _border),
+                ),
+                child: Column(children: [
+                  Text(
+                    _state.power ? _state.modeLabel.toUpperCase() : 'STANDBY',
+                    style: TextStyle(color: _state.power ? _blue : _dim,
+                        fontSize: 12, fontWeight: FontWeight.bold, letterSpacing: 2),
+                  ),
+                  const SizedBox(height: 10),
+                  Row(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    GestureDetector(
+                      onTap: () { if (_state.temperature > 16)
+                        _send(_state.copyWith(temperature: _state.temperature - 1, power: true)); },
+                      child: Container(width: 52, height: 52,
+                        decoration: BoxDecoration(color: _bg, borderRadius: BorderRadius.circular(14),
+                            border: Border.all(color: _border)),
+                        child: const Icon(Icons.remove, color: Colors.white70, size: 26)),
+                    ),
+                    const SizedBox(width: 20),
+                    Column(children: [
+                      Text(_state.temperature.toStringAsFixed(0) + '°C',
+                          style: const TextStyle(color: Colors.white, fontSize: 54,
+                              fontWeight: FontWeight.w200)),
+                      Text('Fan: ' + _state.fanLabel,
+                          style: TextStyle(color: _dim, fontSize: 11)),
+                    ]),
+                    const SizedBox(width: 20),
+                    GestureDetector(
+                      onTap: () { if (_state.temperature < 30)
+                        _send(_state.copyWith(temperature: _state.temperature + 1, power: true)); },
+                      child: Container(width: 52, height: 52,
+                        decoration: BoxDecoration(color: _bg, borderRadius: BorderRadius.circular(14),
+                            border: Border.all(color: _border)),
+                        child: const Icon(Icons.add, color: Colors.white70, size: 26)),
+                    ),
                   ]),
-                ),
-                const SizedBox(height: 16),
-
-                // Mode
-                const Text('MODE',
-                    style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, letterSpacing: 1.5)),
-                const SizedBox(height: 8),
-                Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                  _modeBtn('Auto', kModeAuto, Icons.autorenew),
-                  _modeBtn('Cool', kModeCool, Icons.ac_unit),
-                  _modeBtn('Heat', kModeHeat, Icons.local_fire_department),
-                  _modeBtn('Dry',  kModeDry,  Icons.water_drop),
-                  _modeBtn('Fan',  kModeFan,  Icons.wind_power),
                 ]),
-                const SizedBox(height: 16),
+              ),
+              const SizedBox(height: 16),
 
-                // Fan speed
-                const Text('FAN SPEED',
-                    style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, letterSpacing: 1.5)),
-                const SizedBox(height: 8),
-                Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
-                  _fanBtn('Auto', kFanAuto),
-                  _fanBtn('1', 3),
-                  _fanBtn('2', 4),
-                  _fanBtn('3', 5),
-                  _fanBtn('4', 6),
-                  _fanBtn('5', 7),
-                  _fanBtn('SIL', kFanSilent),
-                ]),
-                const SizedBox(height: 16),
+              // Mode
+              const Text('MODE', style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, letterSpacing: 1.5)),
+              const SizedBox(height: 8),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                _modeBtn('Auto', kModeAuto, Icons.autorenew),
+                _modeBtn('Cool', kModeCool, Icons.ac_unit),
+                _modeBtn('Heat', kModeHeat, Icons.local_fire_department),
+                _modeBtn('Dry',  kModeDry,  Icons.water_drop),
+                _modeBtn('Fan',  kModeFan,  Icons.wind_power),
+              ]),
+              const SizedBox(height: 16),
 
-                // Swing
-                const Text('SWING',
-                    style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, letterSpacing: 1.5)),
-                const SizedBox(height: 8),
-                Row(children: [
-                  Expanded(child: _toggleBtn(
-                      '↕  Swing Vertical', _state.swingV,
-                      () => _send(_state.copyWith(swingV: !_state.swingV)))),
-                  const SizedBox(width: 10),
-                  Expanded(child: _toggleBtn(
-                      '↔  Swing Horizontal', _state.swingH,
-                      () => _send(_state.copyWith(swingH: !_state.swingH)))),
-                ]),
-                const SizedBox(height: 16),
+              // Fan speed
+              const Text('FAN SPEED', style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, letterSpacing: 1.5)),
+              const SizedBox(height: 8),
+              Row(mainAxisAlignment: MainAxisAlignment.spaceBetween, children: [
+                _fanBtn('Auto', kFanAuto), _fanBtn('1', 3), _fanBtn('2', 4),
+                _fanBtn('3', 5), _fanBtn('4', 6), _fanBtn('5', 7), _fanBtn('SIL', kFanSilent),
+              ]),
+              const SizedBox(height: 16),
 
-                // Special modes
-                const Text('SPECIAL MODES',
-                    style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, letterSpacing: 1.5)),
-                const SizedBox(height: 8),
-                GridView.count(
-                  crossAxisCount: 2, shrinkWrap: true,
-                  physics: const NeverScrollableScrollPhysics(),
-                  mainAxisSpacing: 10, crossAxisSpacing: 10,
-                  childAspectRatio: 3.2,
-                  children: [
-                    _toggleBtn('⚡ POWERCHILL', _state.powerful,
-                        () => _send(_state.copyWith(powerful: !_state.powerful))),
-                    _toggleBtn('🌿 ECONO', _state.economy,
-                        () => _send(_state.copyWith(economy: !_state.economy))),
-                    _toggleBtn('🤫 SILENT', _state.silent,
-                        () => _send(_state.copyWith(silent: !_state.silent))),
-                    _toggleBtn('📡 ECO SENSE', _state.ecoSensing,
-                        () => _send(_state.copyWith(ecoSensing: !_state.ecoSensing))),
-                    _toggleBtn('🌊 COANDA', _state.comfort,
-                        () => _send(_state.copyWith(comfort: !_state.comfort))),
-                    _toggleBtn('💤 GOOD SLEEP', _state.silent,
-                        () => _send(_state.copyWith(silent: !_state.silent))),
-                  ],
-                ),
-              ],
-            ),
+              // Swing
+              const Text('SWING', style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, letterSpacing: 1.5)),
+              const SizedBox(height: 8),
+              Row(children: [
+                Expanded(child: _toggleBtn('↕  Swing Vertical', _state.swingV,
+                    () => _send(_state.copyWith(swingV: !_state.swingV)))),
+                const SizedBox(width: 10),
+                Expanded(child: _toggleBtn('↔  Swing Horizontal', _state.swingH,
+                    () => _send(_state.copyWith(swingH: !_state.swingH)))),
+              ]),
+              const SizedBox(height: 16),
+
+              // Special modes
+              const Text('SPECIAL MODES', style: TextStyle(color: Color(0xFF8B949E), fontSize: 11, letterSpacing: 1.5)),
+              const SizedBox(height: 8),
+              GridView.count(
+                crossAxisCount: 2, shrinkWrap: true,
+                physics: const NeverScrollableScrollPhysics(),
+                mainAxisSpacing: 10, crossAxisSpacing: 10, childAspectRatio: 3.2,
+                children: [
+                  _toggleBtn('⚡ POWERCHILL', _state.powerful,
+                      () => _send(_state.copyWith(powerful: !_state.powerful))),
+                  _toggleBtn('🌿 ECONO', _state.economy,
+                      () => _send(_state.copyWith(economy: !_state.economy))),
+                  _toggleBtn('🤫 SILENT', _state.silent,
+                      () => _send(_state.copyWith(silent: !_state.silent))),
+                  _toggleBtn('📡 ECO SENSE', _state.ecoSensing,
+                      () => _send(_state.copyWith(ecoSensing: !_state.ecoSensing))),
+                  _toggleBtn('🌊 COANDA', _state.comfort,
+                      () => _send(_state.copyWith(comfort: !_state.comfort))),
+                  _toggleBtn('💤 GOOD SLEEP', _state.silent,
+                      () => _send(_state.copyWith(silent: !_state.silent))),
+                ],
+              ),
+            ]),
           ),
 
-          // Floating POWER button
+          // ── Floating POWER button (tap + long-press) ──────────────────────
           Positioned(
             bottom: 16, left: 16, right: 16,
             child: GestureDetector(
-              onTap: _sending ? null : () => _send(_state.copyWith(power: !_state.power)),
+              onTap: _powerTap,
+              onLongPressStart: (_) => _startHold(),
+              onLongPressEnd:   (_) => _stopHold(),
+              onLongPressCancel: _stopHold,
               child: AnimatedContainer(
-                duration: const Duration(milliseconds: 300),
-                height: 64,
+                duration: const Duration(milliseconds: 200),
+                height: 68,
                 decoration: BoxDecoration(
-                  color: _state.power ? _green : _red,
+                  color: _holding
+                      ? const Color(0xFFD29922)
+                      : (_state.power ? _green : _red),
                   borderRadius: BorderRadius.circular(18),
                   boxShadow: [BoxShadow(
-                    color: (_state.power ? _green : _red).withAlpha(110),
+                    color: (_holding
+                        ? const Color(0xFFD29922)
+                        : (_state.power ? _green : _red)).withAlpha(110),
                     blurRadius: 20, spreadRadius: 2,
                   )],
                 ),
                 child: Row(mainAxisAlignment: MainAxisAlignment.center, children: [
-                  if (_sending)
+                  if (_sending || _holding)
                     const SizedBox(width: 24, height: 24,
                         child: CircularProgressIndicator(color: Colors.white, strokeWidth: 2.5))
                   else
                     const Icon(Icons.power_settings_new, color: Colors.white, size: 28),
                   const SizedBox(width: 12),
-                  Text(
-                    _sending ? 'SENDING...' : (_state.power ? 'TURN OFF' : 'TURN ON'),
-                    style: const TextStyle(
-                        color: Colors.white, fontSize: 18,
-                        fontWeight: FontWeight.bold, letterSpacing: 1.5),
-                  ),
+                  Column(mainAxisAlignment: MainAxisAlignment.center, children: [
+                    Text(
+                      _holding ? 'HOLDING... (' + (_holdCount + 1).toString() + 'x sent)'
+                          : _sending ? 'SENDING 8x SIGNALS...'
+                          : (_state.power ? 'TURN OFF' : 'TURN ON'),
+                      style: const TextStyle(color: Colors.white, fontSize: 17,
+                          fontWeight: FontWeight.bold, letterSpacing: 1.5),
+                    ),
+                    if (!_sending && !_holding)
+                      Text(
+                        _state.power ? 'TAP or HOLD to turn off' : 'TAP or HOLD to turn on',
+                        style: TextStyle(color: Colors.white.withAlpha(170), fontSize: 10),
+                      ),
+                  ]),
                 ]),
               ),
             ),
           ),
-
         ]),
       ),
     );
