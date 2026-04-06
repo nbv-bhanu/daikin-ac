@@ -13,7 +13,8 @@ class IrService {
     }
   }
 
-  static Future<bool> sendState(AcState state) async {
+  /// Returns null on success, or an error string on failure
+  static Future<String?> sendState(AcState state) async {
     final pattern = DaikinProtocol.buildSignal(
       power:      state.power,
       mode:       state.mode,
@@ -25,16 +26,19 @@ class IrService {
       silent:     state.silent,
       economy:    state.economy,
       ecoSensing: state.ecoSensing,
-      comfort:    state.comfort,
     );
     try {
+      // NOTE: We always attempt transmit even if hasIrEmitter() returned false
+      // because MIUI on some Redmi phones incorrectly reports false but IR still works.
       await _channel.invokeMethod('transmit', {
         'frequency': kDaikinFrequency,
         'pattern':   pattern,
       });
-      return true;
+      return null; // success
+    } on PlatformException catch (e) {
+      return e.message ?? 'Unknown platform error (code: \${e.code})';
     } catch (e) {
-      return false;
+      return e.toString();
     }
   }
 }
